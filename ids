@@ -1,0 +1,146 @@
+#!/usr/bin/env python
+import argparse
+import glob
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+try:
+    import pty
+except ImportError:
+    pty = None
+
+def pipe():
+    if pty:
+        return pty.openpty()
+    else:
+        return pipe()
+
+def threaded(func):
+    def wrap(*args, **kwargs):
+        thread = threading.Thread(target=func, args=args, kwargs=kwargs)
+        thread.daemon = True
+        thread.start()
+    wrap.__name__ = func.__name__
+    wrap.block = func
+    return wrap
+
+@threaded
+def tail(f):
+    c = True
+    while c:
+        c = f.read(1)
+        sys.stdout.write(c)
+
+@threaded
+def tail_open(name):
+    while True:
+        if not os.path.exists(name):
+            time.sleep(0.1)
+    tail.block(f)
+
+class IDA:
+    bins = {
+        'idal': 32,
+        'idal64': 64,
+        'idaw.exe': 32,
+        'idaw64.exe': 64,
+    }
+    locations = {
+        r'C:\Program Files\IDA*': '',
+        r'C:\Program Files (x86)\IDA*': '',
+        r'~/.wine/drive_c/Program Files/IDA*': '',
+        '/Applications/IDA*': 'IDA binaries',
+        '~/Applications/IDA*': 'IDA binaries',
+        # TODO: what's the Linux IDA path?
+        'linux??': '??',
+    }
+
+    @classmethod
+    def find(cls):
+        ret = []
+        for loc, sub in cls.locations.items():
+            for base in sorted(glob.glob(os.path.expanduser(loc)), reverse=True):
+                for name, bits in cls.bins.items():
+                    path = os.path.join(base, sub, name)
+                    match = re.search(r'IDA .*(\d+\.\d+)$', base)
+                    version = None
+                    if match:
+                        version = match.group(1)
+                    if os.path.exists(path):
+                        ret.append(IDA(path, version, bits))
+        return ret
+
+    @property
+    def wine(self):
+        return '.wine' in self.path
+
+    def __init__(self, path, version, bits):
+        self.path = path
+        self.version = version
+        self.bits = bits
+
+    def run(self, idb, script, *args, **kwargs):
+        self.idamaster, self.idaslave = pipe()
+        cmd = [self.path, '-A', '-S', ' '.join([script] + list(args)), idb]
+        if self.wine:
+            cmd = ['wine'] + cmd
+        self.outfile = tempfile.NamedTemporaryFile(delete=True)
+        env = os.environ.copy()
+        env['IDSOUT'] = self.outfile.name
+        if kwargs.get('wait'):
+            env['IDSWAIT'] = '1'
+        print cmd
+        sys.exit(0)
+        # self.p = subprocess.Popen(cmd, stdout=self.idaslave, env=env)
+
+    def tail_ida(self):
+        tail(os.fdopen(self.idamaster, 'r'))
+
+    def tail_script(self):
+        tail(self.outfile)
+
+    def wait(self):
+        return self.p.wait()
+
+    def __repr__(self):
+        return '<IDA %s %d-bit%s>' % (self.version, self.bits, ' (WINE)' if self.wine else '')
+
+class ArgParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_help(sys.stderr)
+        self.exit(2, '%s: error: %s' % (self.prog, message))
+
+if __name__ == '__main__':
+    parser = ArgParser(description='run headless IDA Pro scripts')
+    parser.add_argument('--32', help='Force 32-bit IDA', action='store_true')
+    parser.add_argument('-p', '--print-ida', help='Print IDA output', action='store_true')
+    parser.add_argument('-n', '--native', help="Don't use non-native (WINE) versions of IDA", action='store_true')
+    parser.add_argument('-f', '--version', help='Force IDA version')
+    parser.add_argument('-w', '--wait', help='Wait for auto-analysis to run', action='store_true')
+    parser.add_argument('binary', metavar='<binary>', help='Target binary to load')
+    parser.add_argument('script', metavar='<script>', help='Script to run')
+    parser.add_argument('args', help='Script arguments', nargs='*')
+    args = parser.parse_args()
+
+    paths = IDA.find()
+    bits = 64
+    if getattr(args, '32'):
+        bits = 32
+    paths = sorted([
+        ida for ida in paths
+        if ida.bits == bits
+        and (ida.version == args.version or not args.version)
+        and not (args.native and ida.wine)
+    ], key=lambda x: x.version, reverse=True)
+    ida = paths[0]
+    ida.run(args.binary, args.script, *args.args, wait=args.wait)
+    if args.print_ida:
+        ida.tail_ida()
+
+    ida.tail_script()
+    ida.wait()
